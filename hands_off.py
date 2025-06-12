@@ -2,114 +2,167 @@ import cv2
 import mediapipe as mp
 import subprocess
 import time
+import random
 
 mp_hands = mp.solutions.hands
 mp_face_mesh = mp.solutions.face_mesh
 
-# Threshold distance between hand landmarks and face/neck landmarks to consider "touching"
-TOUCH_THRESHOLD = 0.1  # Adjust as needed (normalized distance)
+hands = mp_hands.Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+face_mesh = mp_face_mesh.FaceMesh(
+    max_num_faces=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
 
-# Minimum duration (in seconds) hands must stay near face/neck to trigger notification
-MIN_TOUCH_DURATION = 2.0
+PROXIMITY_THRESHOLD = 0.1
+hand_start_time = None
+notification_stage = 0
+ANGRY_SOUND = "Funk"
 
+NOTIFICATION_MESSAGES_MILD = [
+    "Hands off your face!",
+    "Stop touching your face!",
+    "Keep those hands away!",
+    "No face touching!",
+]
+
+NOTIFICATION_MESSAGES_ANGRY = [
+    "Seriously, move your hand!",
+    "Enough! Stop touching your face!",
+    "You're doing it again!",
+    "Cut it out now!",
+]
+
+MEAN_TERMINAL_MESSAGES = [
+    "Stop touching your face",
+    "Enough warnings, stop now",
+    "Stop touching your face now",
+    "Thats really gross, stop it",
+]
 
 def send_notification(title, message):
-    subprocess.run(["afplay", f"/System/Library/Sounds/Glass.aiff"])
+    print(f"[NOTIFY] {message}")
+    subprocess.run(["afplay", f"/System/Library/Sounds/{ANGRY_SOUND}.aiff"])
     subprocess.run([
         "osascript", "-e",
         f'display notification "{message}" with title "{title}"'
     ])
 
-    print(f"🔔 Face touched for more than {MIN_TOUCH_DURATION} seconds")
+def show_dialog(message):
+    print("[DIALOG] Showing modal dialog.")
+    subprocess.run([
+        "osascript", "-e",
+        f'display dialog "{message}" buttons {{\"OK\"}} default button 1 with icon caution'
+    ])
 
-def landmarks_distance(landmark1, landmark2):
-    return ((landmark1.x - landmark2.x) ** 2 + (landmark1.y - landmark2.y) ** 2) ** 0.5
+def say_mean_message():
+    phrase = random.choice(MEAN_TERMINAL_MESSAGES)
+    print(f"[SAY] {phrase}")
+    subprocess.run(["say", "-v", "Samantha", phrase])
 
-def is_hand_near_face(hand_landmarks, face_landmarks):
-    # Check hand landmarks against key face landmarks and neck area (neck approx from face mesh points)
-    # Example face landmarks indices for chin and neck-ish areas:
-    # Chin: 152, Neck area approximation: 234, 454 (left and right jawline points)
-    face_points_indices = [152, 234, 454]
+def hand_near_landmark(hand_landmark, face_landmark):
+    dx = hand_landmark.x - face_landmark.x
+    dy = hand_landmark.y - face_landmark.y
+    dz = hand_landmark.z - face_landmark.z
+    distance = (dx*dx + dy*dy + dz*dz)**0.5
+    return distance < PROXIMITY_THRESHOLD
 
-    for h_landmark in hand_landmarks.landmark:
-        for idx in face_points_indices:
-            f_landmark = face_landmarks.landmark[idx]
-            dist = landmarks_distance(h_landmark, f_landmark)
-            if dist < TOUCH_THRESHOLD:
-                print(f"🔍 Hand landmark near face: {h_landmark.x:.2f}, {h_landmark.y:.2f} (dist {dist:.3f})")
+def detect_hand_near_face_or_neck(hand_landmarks, face_landmarks):
+    if not hand_landmarks or not face_landmarks:
+        return False
+
+    face_points_to_check = [
+        face_landmarks.landmark[1],   # Nose
+        face_landmarks.landmark[152], # Chin/Neck base
+    ]
+
+    for hand_lm in hand_landmarks.landmark:
+        for face_lm in face_points_to_check:
+            if hand_near_landmark(hand_lm, face_lm):
+                print(f"[DETECT] Hand near face at ({hand_lm.x:.2f}, {hand_lm.y:.2f})")
                 return True
     return False
 
+def reset_state():
+    global hand_start_time, notification_stage
+    if hand_start_time or notification_stage > 0:
+        print("[STATE] Hand removed. Resetting.")
+    hand_start_time = None
+    notification_stage = 0
+
 def main():
+    global hand_start_time, notification_stage
+
     cap = cv2.VideoCapture(0)
-    with mp_hands.Hands(
-        max_num_hands=2,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7
-    ) as hands, mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7
-    ) as face_mesh:
+    if not cap.isOpened():
+        print("[ERROR] Could not open webcam.")
+        return
 
-        touch_start_time = None
-        notified = False
+    print("[INFO] Monitoring for face touching...")
 
-        while cap.isOpened():
+    try:
+        while True:
             ret, frame = cap.read()
             if not ret:
+                print("[ERROR] Failed to grab frame.")
                 break
 
-            # Flip frame horizontally for natural selfie view
             frame = cv2.flip(frame, 1)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Process face mesh
+            hands_results = hands.process(rgb_frame)
             face_results = face_mesh.process(rgb_frame)
-            if not face_results.multi_face_landmarks:
-                # No face detected, reset timer and flags
-                touch_start_time = None
-                notified = False
-                # Uncomment if you want to see the video:
-                # cv2.imshow('Face Touch Alert', frame)
-                if cv2.waitKey(5) & 0xFF == 27:
-                    break
-                continue
 
-            face_landmarks = face_results.multi_face_landmarks[0]
+            hand_detected = False
 
-            # Process hands
-            hand_results = hands.process(rgb_frame)
-            hand_near_face = False
-
-            if hand_results.multi_hand_landmarks:
-                for hand_landmarks in hand_results.multi_hand_landmarks:
-                    if is_hand_near_face(hand_landmarks, face_landmarks):
-                        hand_near_face = True
+            if hands_results.multi_hand_landmarks and face_results.multi_face_landmarks:
+                for hand_landmarks in hands_results.multi_hand_landmarks:
+                    for face_landmarks in face_results.multi_face_landmarks:
+                        if detect_hand_near_face_or_neck(hand_landmarks, face_landmarks):
+                            hand_detected = True
+                            break
+                    if hand_detected:
                         break
 
-            # Timing logic
-            if hand_near_face:
-                if touch_start_time is None:
-                    touch_start_time = time.time()
-                    notified = False
-                else:
-                    elapsed = time.time() - touch_start_time
-                    if elapsed >= MIN_TOUCH_DURATION and not notified:
-                        send_notification("Stop Touching Your Face", "Please keep your hands away!")
-                        notified = True
+            now = time.time()
+
+            if hand_detected:
+                if hand_start_time is None:
+                    hand_start_time = now
+                    print("[STATE] Started timing contact.")
+
+                elapsed = now - hand_start_time
+                print(f"[STATE] Hand on face for {elapsed:.2f}s")
+
+                if elapsed >= 3 and notification_stage == 0:
+                    msg = random.choice(NOTIFICATION_MESSAGES_MILD)
+                    send_notification("Hands off!", msg)
+                    notification_stage = 1
+                    print("[NOTIFY] First notification sent.")
+
+                elif elapsed >= 6 and notification_stage == 1:
+                    msg = random.choice(NOTIFICATION_MESSAGES_ANGRY)
+                    send_notification("Warning!", msg)
+                    notification_stage = 2
+                    print("[NOTIFY] Second, angrier notification sent.")
+
+                elif elapsed >= 10 and notification_stage == 2:
+                    say_mean_message()
+                    show_dialog("REMOVE YOUR HAND FROM YOUR FACE!")
+                    print("[DIALOG] Blocking dialog shown.")
+                    reset_state()
             else:
-                # Hand moved away, reset timer and notification flag
-                touch_start_time = None
-                notified = False
+                reset_state()
 
-            # Optional: display video feed window if you want (disable to run headless)
-            # cv2.imshow('Face Touch Alert', frame)
-            if cv2.waitKey(5) & 0xFF == 27:
-                break
+    except KeyboardInterrupt:
+        print("\n[EXIT] Exiting.")
 
-        cap.release()
-        cv2.destroyAllWindows()
+    cap.release()
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
