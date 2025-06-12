@@ -1,108 +1,115 @@
 import cv2
 import mediapipe as mp
 import subprocess
-import random
 import time
 
-mp_holistic = mp.solutions.holistic
-mp_drawing = mp.solutions.drawing_utils
+mp_hands = mp.solutions.hands
+mp_face_mesh = mp.solutions.face_mesh
 
-alert_messages = [
-    "Hands near your face! Please stop.",
-    "Avoid touching your face or neck.",
-    "Reminder: Keep your hands away!",
-    "Hands off your face for your health!",
-    "Be mindful: hands near face detected!",
-    "Stop! Don't touch your face or neck!"
-]
+# Threshold distance between hand landmarks and face/neck landmarks to consider "touching"
+TOUCH_THRESHOLD = 0.1  # Adjust as needed (normalized distance)
+
+# Minimum duration (in seconds) hands must stay near face/neck to trigger notification
+MIN_TOUCH_DURATION = 2.0
+
 
 def send_notification(title, message):
+    subprocess.run(["afplay", f"/System/Library/Sounds/Glass.aiff"])
     subprocess.run([
         "osascript", "-e",
         f'display notification "{message}" with title "{title}"'
     ])
-    subprocess.run(["afplay", "/System/Library/Sounds/Sosumi.aiff"])
 
-def hand_near_face_or_neck(hand_landmarks, face_landmarks, neck_landmarks, threshold=0.15):
-    if not hand_landmarks or not face_landmarks:
-        return False
+    print(f"🔔 Face touched for more than {MIN_TOUCH_DURATION} seconds")
 
-    # Check if any hand landmark is close to any face or neck landmark (in normalized coordinates)
-    for hlm in hand_landmarks.landmark:
-        for flm in face_landmarks.landmark:
-            dx = hlm.x - flm.x
-            dy = hlm.y - flm.y
-            dist = (dx*dx + dy*dy)**0.5
-            if dist < threshold:
-                return True
-        for nlk in neck_landmarks:
-            dx = hlm.x - nlk[0]
-            dy = hlm.y - nlk[1]
-            dist = (dx*dx + dy*dy)**0.5
-            if dist < threshold:
+def landmarks_distance(landmark1, landmark2):
+    return ((landmark1.x - landmark2.x) ** 2 + (landmark1.y - landmark2.y) ** 2) ** 0.5
+
+def is_hand_near_face(hand_landmarks, face_landmarks):
+    # Check hand landmarks against key face landmarks and neck area (neck approx from face mesh points)
+    # Example face landmarks indices for chin and neck-ish areas:
+    # Chin: 152, Neck area approximation: 234, 454 (left and right jawline points)
+    face_points_indices = [152, 234, 454]
+
+    for h_landmark in hand_landmarks.landmark:
+        for idx in face_points_indices:
+            f_landmark = face_landmarks.landmark[idx]
+            dist = landmarks_distance(h_landmark, f_landmark)
+            if dist < TOUCH_THRESHOLD:
+                print(f"🔍 Hand landmark near face: {h_landmark.x:.2f}, {h_landmark.y:.2f} (dist {dist:.3f})")
                 return True
     return False
 
 def main():
     cap = cv2.VideoCapture(0)
-    with mp_holistic.Holistic(
-        static_image_mode=False,
-        model_complexity=1,
-        enable_segmentation=False,
-        refine_face_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    ) as holistic:
+    with mp_hands.Hands(
+        max_num_hands=2,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7
+    ) as hands, mp_face_mesh.FaceMesh(
+        max_num_faces=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.7
+    ) as face_mesh:
 
-        alert_cooldown = 5  # seconds
-        last_alert_time = 0
+        touch_start_time = None
+        notified = False
 
-        while True:
+        while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Convert BGR to RGB
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            # Flip frame horizontally for natural selfie view
+            frame = cv2.flip(frame, 1)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            results = holistic.process(image)
+            # Process face mesh
+            face_results = face_mesh.process(rgb_frame)
+            if not face_results.multi_face_landmarks:
+                # No face detected, reset timer and flags
+                touch_start_time = None
+                notified = False
+                # Uncomment if you want to see the video:
+                # cv2.imshow('Face Touch Alert', frame)
+                if cv2.waitKey(5) & 0xFF == 27:
+                    break
+                continue
 
-            # Extract landmarks
-            right_hand = results.right_hand_landmarks
-            left_hand = results.left_hand_landmarks
-            face_landmarks = results.face_landmarks
+            face_landmarks = face_results.multi_face_landmarks[0]
 
-            # Approximate neck points based on shoulders (pose landmarks)
-            neck_landmarks = []
-            if results.pose_landmarks:
-                # Using shoulders as proxy for neck
-                left_shoulder = results.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
-                right_shoulder = results.pose_landmarks.landmark[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
-                # Midpoint between shoulders as neck approx
-                neck_x = (left_shoulder.x + right_shoulder.x) / 2
-                neck_y = (left_shoulder.y + right_shoulder.y) / 2
-                neck_landmarks.append((neck_x, neck_y))
+            # Process hands
+            hand_results = hands.process(rgb_frame)
+            hand_near_face = False
 
-            # Check hands near face or neck
-            hands_near = False
-            if right_hand and face_landmarks and neck_landmarks:
-                hands_near = hand_near_face_or_neck(right_hand, face_landmarks, neck_landmarks)
-            if not hands_near and left_hand and face_landmarks and neck_landmarks:
-                hands_near = hand_near_face_or_neck(left_hand, face_landmarks, neck_landmarks)
+            if hand_results.multi_hand_landmarks:
+                for hand_landmarks in hand_results.multi_hand_landmarks:
+                    if is_hand_near_face(hand_landmarks, face_landmarks):
+                        hand_near_face = True
+                        break
 
-            # Alert with cooldown
-            if hands_near:
-                current_time = time.time()
-                if current_time - last_alert_time > alert_cooldown:
-                    alert_msg = random.choice(alert_messages)
-                    send_notification("Warning", alert_msg)
-                    print("🔔 Notification sent:", alert_msg)
-                    last_alert_time = current_time
+            # Timing logic
+            if hand_near_face:
+                if touch_start_time is None:
+                    touch_start_time = time.time()
+                    notified = False
+                else:
+                    elapsed = time.time() - touch_start_time
+                    if elapsed >= MIN_TOUCH_DURATION and not notified:
+                        send_notification("Stop Touching Your Face", "Please keep your hands away!")
+                        notified = True
+            else:
+                # Hand moved away, reset timer and notification flag
+                touch_start_time = None
+                notified = False
 
-            # No video display, so just keep looping
+            # Optional: display video feed window if you want (disable to run headless)
+            # cv2.imshow('Face Touch Alert', frame)
+            if cv2.waitKey(5) & 0xFF == 27:
+                break
 
-            # Small sleep to reduce CPU
-            time.sleep(0.01)
+        cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
