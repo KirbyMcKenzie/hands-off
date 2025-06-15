@@ -59,10 +59,6 @@ def show_dialog(message):
         f'display dialog "{message}" buttons {{\"OK\"}} default button 1 with icon caution'
     ])
 
-def say_mean_message():
-    phrase = random.choice(MEAN_TERMINAL_MESSAGES)
-    print(f"[SAY] {phrase}")
-    subprocess.run(["say", "-v", "Samantha", phrase])
 
 def hand_near_landmark(hand_landmark, face_landmark):
     dx = hand_landmark.x - face_landmark.x
@@ -151,7 +147,6 @@ def main():
                     print("[NOTIFY] Second, angrier notification sent.")
 
                 elif elapsed >= 10 and notification_stage == 2:
-                    say_mean_message()
                     show_dialog("REMOVE YOUR HAND FROM YOUR FACE!")
                     print("[DIALOG] Blocking dialog shown.")
                     reset_state()
